@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ASCII Reveal</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;}
+  #stage{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;}
+  canvas{display:block;}
+  #hint{position:fixed;left:0;right:0;bottom:10px;text-align:center;color:#6f9;
+        font-family:"Consolas","Menlo",monospace;font-size:12px;opacity:.45;
+        pointer-events:none;user-select:none;}
+  #load{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
+        color:#6f9;font-family:"Consolas","Menlo",monospace;font-size:14px;background:#000;z-index:5;}
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="disp"></canvas></div>
+<div id="load">building ascii…</div>
+<div id="hint">click or press R to replay</div>
+<script>
+(function(){
+"use strict";
+/* ---------------- settings (mirror of tae.py) ---------------- */
+const SRC='photo.jpg';
+const CW=5, CH=9, COLS=256, ROWS=97;            // grid + cell size -> W x H
+const W=COLS*CW, H=ROWS*CH;                       // 1280 x 873
+const RAMP=" :;irsXA253hMHGS#988";                 // light -> dense
+const SUBJECT_RECT=[215,80,295,334];              // (x,y,w,h) in source pixels
+const REVEAL_SECONDS=6.8;
+const MAXPROC=600;                                 // cap processing resolution
+const N=ROWS*COLS, HW=H*W;
+
+/* ---------------- utils ---------------- */
+const clamp=(v,a,b)=>v<a?a:v>b?b:v;
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);
+  t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+const rng=mulberry32(7);                           // seeded, like np.random.default_rng(7)
+
+function boxBlur(src,w,h,radius,passes){
+  const tmp=new Float32Array(w*h); let a=src;
+  for(let p=0;p<passes;p++){
+    for(let y=0;y<h;y++){const ro=y*w;let acc=0;
+      for(let x=-radius;x<=radius;x++)acc+=a[ro+clamp(x,0,w-1)];
+      for(let x=0;x<w;x++){tmp[ro+x]=acc/(2*radius+1);
+        acc+=a[ro+clamp(x+radius+1,0,w-1)]-a[ro+clamp(x-radius,0,w-1)];}}
+    for(let x=0;x<w;x++){let acc=0;
+      for(let y=-radius;y<=radius;y++)acc+=tmp[clamp(y,0,h-1)*w+x];
+      for(let y=0;y<h;y++){a[y*w+x]=acc/(2*radius+1);
+        acc+=tmp[clamp(y+radius+1,0,h-1)*w+x]-tmp[clamp(y-radius,0,h-1)*w+x];}}
+  }
+  return a;
+}
+function morph(src,w,h,radius,isMax){
+  const out=new Float32Array(w*h);
+  for(let y=0;y<h;y++)for(let x=0;x<w;x++){let v=isMax?-1/0:1/0;
+    for(let dy=-radius;dy<=radius;dy++){const yy=clamp(y+dy,0,h-1);
+      for(let dx=-radius;dx<=radius;dx++){const xx=clamp(x+dx,0,w-1);
+        const val=src[yy*w+xx]; v=isMax?Math.max(v,val):Math.min(v,val);}}
+    out[y*w+x]=v;}
+  return out;
+}
+function areaDown(src,sw,sh,dw,dh){
+  const out=new Float32Array(dw*dh);
+  for(let dy=0;dy<dh;dy++){const sy0=Math.floor(dy*sh/dh),sy1=Math.max(sy0+1,Math.floor((dy+1)*sh/dh));
+    for(let dx=0;dx<dw;dx++){const sx0=Math.floor(dx*sw/dw),sx1=Math.max(sx0+1,Math.floor((dx+1)*sw/dw));
+      let acc=0,cnt=0;
+      for(let sy=sy0;sy<sy1;sy++)for(let sx=sx0;sx<sx1;sx++){acc+=src[sy*sw+sx];cnt++;}
+      out[dy*dw+dx]=cnt?acc/cnt:0;}}
+  return out;
+}
+function pctArr(arr,p){if(!arr.length)return 0;const s=Float32Array.from(arr).sort();
+  return s[Math.min(s.length-1,Math.max(0,Math.floor(p*(s.length-1))))];}
+
+/* ---------------- state ---------------- */
+let atlas,cidx,randPool;
+const target=new Uint16Array(N), phase=new Uint8Array(N);
+const tint=new Float32Array(N), trev=new Float32Array(N), sx=new Float32Array(N), sy=new Float32Array(N);
+const idxArr=new Uint16Array(N), intenArr=new Float32Array(N);
+const lum=new Float32Array(HW);
+let _tick=-1, _rnd=new Uint16Array(N);
+function randomLetters(t){const tk=Math.floor(t*15);
+  if(tk!==_tick){_tick=tk;for(let i=0;i<N;i++)_rnd[i]=randPool[(rng()*randPool.length)|0];}return _rnd;}
+
+/* ---------------- canvases ---------------- */
+const disp=document.getElementById('disp'); const dctx=disp.getContext('2d');
+const buf=document.createElement('canvas'); buf.width=W; buf.height=H; const bctx=buf.getContext('2d');
+const glow=document.createElement('canvas'); glow.width=W; glow.height=H; const gctx=glow.getContext('2d');
+const pc=document.createElement('canvas'); const pctx=pc.getContext('2d',{willReadFrequently:true});
+const imageData=bctx.createImageData(W,H); const rgba=imageData.data;
+
+/* ---------------- 1. atlas: glyph coverage for every character ---------------- */
+function buildAtlas(){
+  const chars=[]; for(let c=33;c<127;c++)chars.push(String.fromCharCode(c));
+  atlas=new Float32Array((chars.length+1)*CH*CW);   // index 0 = empty cell
+  cidx={};
+  const SS=4;                                        // supersample for clean glyphs
+  const tc=document.createElement('canvas'); tc.width=CW*SS; tc.height=CH*SS;
+  const tctx=tc.getContext('2d',{willReadFrequently:true});
+  tctx.font='bold '+(8*SS)+'px "Consolas","Menlo","Courier New",monospace';
+  tctx.textAlign='center'; tctx.textBaseline='middle';
+  for(let i=0;i<chars.length;i++){
+    cidx[chars[i]]=i+1;
+    tctx.clearRect(0,0,tc.width,tc.height); tctx.fillStyle='#fff';
+    tctx.fillText(chars[i],tc.width/2,tc.height/2);
+    const d=tctx.getImageData(0,0,tc.width,tc.height).data; const base=(i+1)*CH*CW;
+    for(let y=0;y<CH;y++)for(let x=0;x<CW;x++){let s=0;
+      for(let sy=0;sy<SS;sy++)for(let sx=0;sx<SS;sx++)s+=d[((y*SS+sy)*tc.width+(x*SS+sx))*4];
+      atlas[base+y*CW+x]=s/(SS*SS*255);}
+  }
+  randPool=[]; const pool='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789@#$%&*+=<>?/\\|{}[]';
+  for(const ch of pool) if(cidx[ch]) randPool.push(cidx[ch]);
+}
+
+/* ---------------- 2. photo -> grid of characters ---------------- */
+function processImage(img){
+  const nw=img.naturalWidth, nh=img.naturalHeight;
+  const scale=Math.min(1,MAXPROC/Math.max(nw,nh));
+  const pw=Math.max(1,Math.round(nw*scale)), ph=Math.max(1,Math.round(nh*scale));
+  pc.width=pw; pc.height=ph; pctx.drawImage(img,0,0,pw,ph);
+  const data=pctx.getImageData(0,0,pw,ph).data;
+  const g0=new Float32Array(pw*ph);
+  for(let i=0;i<pw*ph;i++){const o=i*4;g0[i]=0.299*data[o]+0.587*data[o+1]+0.114*data[o+2];}
+
+  let rx=clamp(SUBJECT_RECT[0]*scale,0,pw), ry=clamp(SUBJECT_RECT[1]*scale,0,ph);
+  let rw=Math.min(SUBJECT_RECT[2]*scale,pw-rx), rh=Math.min(SUBJECT_RECT[3]*scale,ph-ry);
+  const mask=new Float32Array(pw*ph);
+  for(let y=0;y<ph;y++)for(let x=0;x<pw;x++)mask[y*pw+x]=(x>=rx&&x<rx+rw&&y>=ry&&y<ry+rh)?1:0;
+  const m=boxBlur(mask,pw,ph,Math.max(2,Math.round(0.03*Math.max(pw,ph))),3);
+
+  const vals=[]; for(let i=0;i<pw*ph;i++)if(m[i]>0.5)vals.push(g0[i]);
+  const lo=pctArr(vals,0.02), hi=pctArr(vals,0.99);
+
+  const dil=morph(m,pw,ph,2,true), ero=morph(m,pw,ph,2,false);
+  const rimRaw=new Float32Array(pw*ph);
+  for(let i=0;i<pw*ph;i++)rimRaw[i]=Math.abs(dil[i]-ero[i]);
+  const rim=boxBlur(rimRaw,pw,ph,2,1);
+
+  const comb=new Float32Array(pw*ph);
+  for(let i=0;i<pw*ph;i++){let s=clamp((g0[i]-lo)/(hi-lo),0,1);s=Math.pow(s,1.3);const sub=0.05+0.95*s;
+    const bg=Math.pow(g0[i]/255,1.1)*0.30;comb[i]=clamp(sub*m[i]+bg*(1-m[i])+0.55*rim[i],0,1);}
+
+  const g=areaDown(comb,pw,ph,COLS,ROWS);
+  const gb=boxBlur(Float32Array.from(g),COLS,ROWS,1,1);
+  for(let i=0;i<N;i++)g[i]=clamp(g[i]+1.1*(g[i]-gb[i]),0,255);
+  const glo=pctArr(Array.from(g),0.01), ghi=pctArr(Array.from(g),0.995);
+
+  const dist=new Float32Array(N); let dmax=0;
+  for(let r=0;r<ROWS;r++)for(let c=0;c<COLS;c++){const i=r*COLS+c;
+    dist[i]=Math.hypot((c-COLS/2)/COLS*1.45,(r-ROWS/2)/ROWS); sx[i]=c*0.15; sy[i]=r*0.2;
+    if(dist[i]>dmax)dmax=dist[i];
+    let b=clamp((g[i]-glo)/(ghi-glo),0,1);
+    const lv=Math.min(Math.floor(b*RAMP.length),RAMP.length-1);
+    const ch=RAMP[lv]; target[i]=ch===' '?0:(cidx[ch]||0); if(lv===0)target[i]=0; tint[i]=0.30+0.70*b;
+  }
+  for(let i=0;i<N;i++)trev[i]=1.2+(REVEAL_SECONDS-1.8)*(dmax?dist[i]/dmax:0)+rng()*1.1;
+  for(let i=0;i<N;i++)phase[i]=rng()<0.5?0:1;
+}
+
+/* ---------------- 3. render one frame ---------------- */
+function render(t){
+  const rnd=randomLetters(t);
+  const fade=Math.min(1,t/0.6);
+  for(let i=0;i<N;i++){
+    const dtv=t-trev[i]; const locked=dtv>=0; let gidx,it;
+    if(locked){
+      if(target[i]===0){gidx=rnd[i];it=clamp(1-dtv/0.25,0,1)*0.5*fade;}      // empty cell: noise dies fast
+      else{gidx=target[i];const flash=clamp(1-dtv/0.35,0,1);
+        it=tint[i]*(1+0.55*flash)*(1+0.04*Math.sin(t*3+sx[i]+sy[i]));}          // locked + shimmer
+    }else{gidx=rnd[i];const pre=0.22+0.5*clamp(1+dtv/0.9,0,1);
+      const flick=(((Math.floor(t*30)+phase[i])%2)===0)?1:0.85;it=pre*flick;}   // pre-reveal noise
+    it*=fade; if(it>1.6)it=1.6; else if(it<0)it=0;
+    idxArr[i]=gidx; intenArr[i]=it;
+  }
+  // paste glyphs -> luminance
+  for(let r=0;r<ROWS;r++){const y0=r*CH;
+    for(let c=0;c<COLS;c++){const ci=r*COLS+c;const gidx=idxArr[ci];const it=intenArr[ci];
+      const base=gidx*CH*CW;const x0=c*CW;
+      for(let py=0;py<CH;py++){const ro=(y0+py)*W+x0;const ab=base+py*CW;
+        for(let px=0;px<CW;px++)lum[ro+px]=atlas[ab+px]*it;}}}
+  // color: white with slight cyan tint
+  for(let i=0;i<HW;i++){let l=lum[i];l=l<0?0:l>1?1:l;const o=i*4;
+    rgba[o]=l*209.1;rgba[o+1]=l*249.9;rgba[o+2]=l*255;rgba[o+3]=255;}
+  bctx.putImageData(imageData,0,0);
+  // glow (half-strength blurred copy added back)
+  gctx.save();gctx.clearRect(0,0,W,H);gctx.filter='blur(4px)';gctx.drawImage(buf,0,0);gctx.restore();
+  bctx.save();bctx.globalCompositeOperation='lighter';bctx.globalAlpha=0.5;bctx.drawImage(glow,0,0);bctx.restore();
+}
+
+/* ---------------- 4. display (scale buffer to fit window) ---------------- */
+function drawDisplay(){
+  const dpr=window.devicePixelRatio||1; const cw=window.innerWidth, chh=window.innerHeight;
+  if(disp.width!==Math.round(cw*dpr)||disp.height!==Math.round(chh*dpr)){
+    disp.width=Math.round(cw*dpr); disp.height=Math.round(chh*dpr);
+    disp.style.width=cw+'px'; disp.style.height=chh+'px';}
+  dctx.setTransform(dpr,0,0,dpr,0,0);
+  dctx.fillStyle='#000'; dctx.fillRect(0,0,cw,chh);
+  const scale=Math.min(cw/W,chh/H); const dw=W*scale, dh=H*scale;
+  dctx.imageSmoothingEnabled=true; dctx.imageSmoothingQuality='high';
+  dctx.drawImage(buf,(cw-dw)/2,(chh-dh)/2,dw,dh);
+}
+
+/* ---------------- 5. loop + input ---------------- */
+let ready=false, startPerf=0;
+function loop(){if(ready){render((performance.now()-startPerf)/1000);drawDisplay();}requestAnimationFrame(loop);}
+function replay(){startPerf=performance.now();}
+
+buildAtlas();
+const img=new Image();
+img.onload=()=>{try{processImage(img);}catch(e){console.error(e);
+  document.getElementById('load').textContent='error: '+e.message;return;}
+  ready=true; startPerf=performance.now();
+  document.getElementById('load').style.display='none'; requestAnimationFrame(loop);};
+img.onerror=()=>{document.getElementById('load').textContent='could not load '+SRC;};
+img.src=SRC;
+
+window.addEventListener('resize',drawDisplay);
+window.addEventListener('keydown',e=>{if(e.key==='r'||e.key==='R')replay();});
+document.addEventListener('click',replay);
+})();
+</script>
+</body>
+</html>
